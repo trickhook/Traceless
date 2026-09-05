@@ -11,7 +11,7 @@ if [ "$BOOTMODE" ] && [ "$KSU" ]; then
   if [ "$(which magisk)" ]; then
     ui_print "*********************************************************"
     ui_print "! Multiple root implementation is NOT supported!"
-    ui_print "! Please uninstall Magisk before installing Zygisk Next"
+    ui_print "! Please uninstall Magisk before installing Traceless"
     abort    "*********************************************************"
   fi
 elif [ "$BOOTMODE" ] && [ "$MAGISK_VER_CODE" ]; then

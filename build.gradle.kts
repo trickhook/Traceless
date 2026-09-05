@@ -39,7 +39,7 @@ val gitCommitHash = "git rev-parse --verify --short HEAD".execute()
 // also the soname
 val moduleId by extra("zygisk_traceless")
 val moduleName by extra("Traceless")
-val verName by extra("v0.0.1")
+val verName by extra("v0.0.2")
 val verCode by extra(gitCommitCount)
 val commitHash by extra(gitCommitHash)
 val abiList by extra(listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64"))
@@ -58,7 +58,7 @@ tasks.register("Delete", Delete::class) {
 
 fun Project.configureBaseExtension() {
     extensions.findByType(AppExtension::class)?.run {
-        namespace = "io.github.mhmrdd.zygisk.module.traceless"
+        namespace = "io.github.trickhook.zygisk.module.traceless"
         compileSdkVersion(androidCompileSdkVersion)
         ndkVersion = androidCompileNdkVersion
         buildToolsVersion = androidBuildToolsVersion

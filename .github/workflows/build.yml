@@ -1,0 +1,47 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager "ndk;26.0.10792818" "cmake;3.22.1"
+
+      - name: Build release module zip
+        run: ./gradlew :module:zipRelease --stacktrace
+
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: traceless-module
+          path: module/release/*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: module/release/*.zip
