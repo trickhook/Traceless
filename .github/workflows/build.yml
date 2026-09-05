@@ -35,6 +35,28 @@ jobs:
           chmod +x ./gradlew
           ./gradlew :module:zipRelease --stacktrace
 
+      - name: Dump native (CMake) build diagnostics on failure
+        if: failure()
+        run: |
+          echo "===== metadata_generation_stderr.txt (CMake configure stderr) ====="
+          find module -name 'metadata_generation_stderr.txt' -print -exec cat {} \; || true
+          echo "===== metadata_generation_command.txt ====="
+          find module -name 'metadata_generation_command.txt' -print -exec cat {} \; || true
+          echo "===== CMakeError.log ====="
+          find module -name 'CMakeError.log' -print -exec cat {} \; || true
+          echo "===== CMakeOutput.log (tail) ====="
+          find module -name 'CMakeOutput.log' -print -exec sh -c 'tail -n 80 "$1"' _ {} \; || true
+
+      - name: Upload native build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxx-logs
+          path: |
+            module/.cxx/**
+            module/build/**/cxx/**
+          if-no-files-found: ignore
+
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
         with:
