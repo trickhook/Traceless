@@ -31,7 +31,9 @@ jobs:
           sdkmanager "ndk;26.0.10792818" "cmake;3.22.1"
 
       - name: Build release module zip
-        run: ./gradlew :module:zipRelease --stacktrace
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :module:zipRelease --stacktrace
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4

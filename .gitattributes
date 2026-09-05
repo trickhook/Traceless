@@ -1,0 +1,14 @@
+# Normalize line endings. Shell scripts and the Gradle wrapper MUST use LF or
+# they fail to exec on Linux/CI ("/usr/bin/env: 'sh\r'").
+* text=auto eol=lf
+gradlew text eol=lf
+*.sh text eol=lf
+
+# Windows-only files keep CRLF.
+gradlew.bat text eol=crlf
+*.bat text eol=crlf
+
+# Don't touch binaries.
+*.jar binary
+*.so binary
+*.png binary
