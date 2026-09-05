@@ -32,20 +32,19 @@ jobs:
 
       - name: Build release module zip
         run: |
+          set -o pipefail
           chmod +x ./gradlew
-          ./gradlew :module:zipRelease --stacktrace
+          ./gradlew :module:zipRelease --stacktrace 2>&1 | tee gradle-build.log
 
-      - name: Dump native (CMake) build diagnostics on failure
+      - name: Show CMake / native errors on failure
         if: failure()
         run: |
-          echo "===== metadata_generation_stderr.txt (CMake configure stderr) ====="
+          echo "===== C/C++ and CMake error lines ====="
+          grep -nE 'C/C\+\+:|CMake Error|CMake Warning|Cannot find source file|No SOURCES|error:|fatal error' gradle-build.log | head -200 || true
+          echo "===== context around first 'CMake Error' ====="
+          grep -nB2 -A8 'CMake Error' gradle-build.log | head -160 || true
+          echo "===== metadata_generation_stderr.txt (if present) ====="
           find module -name 'metadata_generation_stderr.txt' -print -exec cat {} \; || true
-          echo "===== metadata_generation_command.txt ====="
-          find module -name 'metadata_generation_command.txt' -print -exec cat {} \; || true
-          echo "===== CMakeError.log ====="
-          find module -name 'CMakeError.log' -print -exec cat {} \; || true
-          echo "===== CMakeOutput.log (tail) ====="
-          find module -name 'CMakeOutput.log' -print -exec sh -c 'tail -n 80 "$1"' _ {} \; || true
 
       - name: Upload native build logs on failure
         if: failure()
@@ -53,6 +52,7 @@ jobs:
         with:
           name: cxx-logs
           path: |
+            gradle-build.log
             module/.cxx/**
             module/build/**/cxx/**
           if-no-files-found: ignore
