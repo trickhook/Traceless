@@ -7,54 +7,34 @@
  * companion process feature.
  */
 #include <cstdlib>
+#include <cstdio>
+#include <cstdarg>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <android/log.h>
 #include "mountsinfo.cpp"
 #include "utils.cpp"
 #include <sys/mount.h>
-#include <functional>
+#include <sys/syscall.h>
 #include <set>
 #include <string>
 #include <vector>
-#include <system_error>
-#include <map>
-#include <mutex>
 #include <errno.h>
 #include <cstring>
+#include <sstream>
 #include "zygisk.hpp"
-#include <sys/ptrace.h>
-#include <dlfcn.h>
-#include <string.h>
-#include <thread>
 
-//typedef void* (*dlopen_fn_t)(const char*, int);
-//
-//static dlopen_fn_t original_dlopen = nullptr;
-//
-//static void* my_dlopen(const char* filename, int flags) {
-////    if (filename && strstr(filename, "libc++_shared.so")) {
-////        void* handle = original_dlopen("/data/adb/modules/traceless/lib/arm64-v8a/libc++_shared.so", flags);
-////        if (handle) {
-////            return handle;
-////        }
-////    }
-//    return original_dlopen(filename, flags);
-//}
-//
-//__attribute__((constructor))
-//void init_dlopen_hook() {
-//    original_dlopen = reinterpret_cast<dlopen_fn_t>(dlsym(RTLD_NEXT, "dlopen"));
-//
-//    void* libdl = dlopen("libdl.so", RTLD_NOW);
-//    if (libdl) {
-//        void** dlopen_ptr = reinterpret_cast<void**>(dlsym(libdl, "dlopen"));
-//        if (dlopen_ptr) {
-//            *dlopen_ptr = reinterpret_cast<void*>(my_dlopen);
-//        }
-//        dlclose(libdl);
-//    }
-//}
+// Single source of truth for the runtime version string. CI can override this
+// via a -DTRACELESS_VERSION="..." compile definition; the default is kept in
+// sync with the Gradle verName so logcat and module.prop never disagree.
+#ifndef TRACELESS_VERSION
+#define TRACELESS_VERSION "v0.0.2"
+#endif
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
 
 #define LOG_TAG "Traceless"
 #define TL_LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -74,11 +54,6 @@ static const std::set<std::string> suspicious_mount_sources = {
         "worker"
 };
 
-enum Advice {
-    NORMAL = 0,
-    MODULE_CONFLICT = 2,
-};
-
 enum State {
     SUCCESS = 0,
     FAILURE = 1
@@ -86,42 +61,35 @@ enum State {
 
 static const std::string magisk_data_path_prefix = "/data/adb";
 static const std::string magisk_modules_path_prefix = "/data/adb/modules/";
+// The mount "root" field in /proc/<pid>/mountinfo is relative to the source
+// filesystem's own root, so a bind mount of /data/adb/modules/<mod>/... shows
+// up as ".../adb/modules/..." rather than "/data/adb/...".
+static const char *const module_root_marker = "/adb/modules/";
 static const char *const maps_filter_target = "jit-cache-zygisk_traceless";
 static const char *const self_maps_path = "/proc/self/maps";
 static const char *const pid_maps_prefix = "/proc/";
 static const char *const maps_suffix = "/maps";
 
 // --- Zygisk Module Implementation ---
+// We hook the framework's unshare (in libandroid_runtime, the actual caller of
+// the specialization-time unshare) plus the file-open primitives in libc so a
+// denylisted process reads a sanitized /proc/<pid>/maps.
 int (*original_unshare)(int) = nullptr;
 
 static FILE *(*original_fopen)(const char *, const char *) = nullptr;
-
-static char *(*original_fgets)(char *, int, FILE *) = nullptr;
 
 static int (*original_open)(const char *, int, ...) = nullptr;
 
 static int (*original_openat)(int, const char *, int, ...) = nullptr;
 
-static ssize_t (*original_read)(int, void *, size_t) = nullptr;
-
-static ssize_t (*original_pread64)(int, void *, size_t, off64_t) = nullptr;
-
-static int (*original_close)(int) = nullptr;
-
-// Flag to indicate if we are currently processing a /proc/.../maps file via fopen/fgets
-static thread_local bool filtering_maps_stream = false; // Use thread_local for safety
-
-// Structure to hold state for filtered file descriptors (using pipes)
-struct FilteredFdInfo {
-    std::string original_path;
-    // Add any other relevant state if needed
-};
-
-// Map to track fake FDs (pipe read ends) associated with filtered maps files
-// Key: fake_fd (pipe read end), Value: Info about the original file
-static std::map<int, FilteredFdInfo> filtered_fds;
-static std::mutex filtered_fds_mutex; // Mutex to protect access to the map
-
+// Create an in-memory file. memfd-backed descriptors behave like regular files
+// (seekable, pread-able, fstat reports a regular file, mmap works), unlike a
+// pipe, so a substituted /proc/<pid>/maps does not break legitimate readers and
+// is far less tamper-evident. Uses the raw syscall because the memfd_create libc
+// wrapper is only available from API 30 while this module targets API 26+.
+static int create_memfd(const char *name) {
+    return static_cast<int>(syscall(SYS_memfd_create, name, MFD_CLOEXEC));
+}
 
 // Helper function to check if a path is a proc maps file
 static bool isProcMapsFile(const char *path) {
@@ -164,115 +132,94 @@ static std::string filterMapsContent(const std::string &content) {
     return output_ss.str();
 }
 
+// Build a read-only memfd holding the filtered maps content. On success the
+// returned fd contains the sanitized text rewound to offset 0. Returns -1 and
+// sets errno on hard failure.
+static int makeFilteredMemfd(const std::string &content) {
+    std::string filtered = filterMapsContent(content);
+    int mfd = create_memfd("jit-cache");
+    if (mfd < 0) {
+        return -1;
+    }
+    size_t total_written = 0;
+    const char *data = filtered.data();
+    size_t data_len = filtered.size();
+    while (total_written < data_len) {
+        ssize_t written = TEMP_FAILURE_RETRY(::write(mfd, data + total_written,
+                                                     data_len - total_written));
+        if (written <= 0) {
+            ::close(mfd);
+            errno = EIO;
+            return -1;
+        }
+        total_written += static_cast<size_t>(written);
+    }
+    ::lseek(mfd, 0, SEEK_SET);
+    return mfd;
+}
 
 static int reshare(int flags) {
     errno = 0;
     return flags == CLONE_NEWNS ? 0 : original_unshare(flags & ~CLONE_NEWNS);
 }
 
-// Hook for fopen (unchanged, uses thread_local flag)
+// Hook for fopen. For a maps path we read the real file, then hand back a FILE*
+// wrapping a filtered memfd, so every stdio consumer (fgets/fread/getline/...)
+// transparently sees sanitized content. Non-maps paths pass straight through.
 static FILE *my_fopen(const char *path, const char *mode) {
     if (!original_fopen) {
         TL_LOGE("my_fopen: original_fopen is null!");
         errno = EFAULT;
         return nullptr;
     }
-    if (isProcMapsFile(path)) {
-        TL_LOGD("my_fopen: Hooked fopen for maps file: %s", path);
-        filtering_maps_stream = true;
-    } else {
-        filtering_maps_stream = false;
+    if (!isProcMapsFile(path)) {
+        return original_fopen(path, mode);
     }
-    return original_fopen(path, mode);
+
+    FILE *real = original_fopen(path, "re");
+    if (!real) {
+        return original_fopen(path, mode); // preserve original error semantics
+    }
+    std::string content = readFdToString(fileno(real));
+    fclose(real);
+    if (content.empty()) {
+        // Nothing to hide (or a transient read hiccup): give back the real file
+        // rather than fabricating an impossible error.
+        return original_fopen(path, mode);
+    }
+
+    int mfd = makeFilteredMemfd(content);
+    if (mfd < 0) {
+        TL_LOGW("my_fopen: memfd fallback failed for %s: %s", path, strerror(errno));
+        return original_fopen(path, mode);
+    }
+    FILE *fp = fdopen(mfd, "r");
+    if (!fp) {
+        ::close(mfd);
+        return original_fopen(path, mode);
+    }
+    TL_LOGD("my_fopen: served filtered maps for %s", path);
+    return fp;
 }
 
-// Hook for fgets (unchanged, uses thread_local flag)
-static char *my_fgets(char *s, int size, FILE *stream) {
-    if (!original_fgets) {
-        TL_LOGE("my_fgets: original_fgets is null!");
-        return nullptr;
-    }
-    if (!filtering_maps_stream) {
-        return original_fgets(s, size, stream);
-    }
-    char *result;
-    while (true) {
-        result = original_fgets(s, size, stream);
-        if (!result) {
-            filtering_maps_stream = false; // Reset flag on EOF/error
-            break;
-        }
-        if (strstr(s, maps_filter_target) == nullptr) {
-            break; // Line is okay
-        }
-        TL_LOGD("my_fgets: Filtering line containing 	'%s'", maps_filter_target);
-        // Loop to read next line
-    }
-    return result;
-}
-
-// Writer thread function
-void pipeWriterThreadFunc(int write_fd, std::string content) {
-    size_t total_written = 0;
-    const char *data = content.c_str();
-    size_t data_len = content.length();
-    while (total_written < data_len) {
-        ssize_t written = TEMP_FAILURE_RETRY(
-                ::write(write_fd, data + total_written, data_len - total_written)
-        );
-        if (written <= 0) break;
-        total_written += written;
-    }
-    ::close(write_fd);
-}
-
-// Common logic for open/openat hooks
+// Common logic for open/openat hooks: return a filtered memfd in place of the
+// real maps file.
 static int handle_open_maps(const char *path, int real_fd) {
-    TL_LOGD("handle_open_maps: Opened maps file: %s (real_fd: %d)", path, real_fd);
-
-    // 1. Read original content
-    std::string original_content = readFdToString(real_fd);
-
-    // 2. Close the real FD immediately
-    if (original_close(real_fd) != 0) {
-        TL_LOGW("handle_open_maps: Failed to close real_fd %d: %s", real_fd, strerror(errno));
-        // Continue anyway, but log
+    std::string content = readFdToString(real_fd);
+    if (content.empty()) {
+        // Hand back a valid, rewound real fd instead of an EIO tell.
+        ::lseek(real_fd, 0, SEEK_SET);
+        return real_fd;
     }
+    ::close(real_fd);
 
-    if (original_content.empty()) {
-        TL_LOGE("handle_open_maps: Failed to read content from real_fd %d for path %s", real_fd,
-                path);
-        errno = EIO; // Input/output error
+    int mfd = makeFilteredMemfd(content);
+    if (mfd < 0) {
+        TL_LOGE("handle_open_maps: memfd fallback failed for %s: %s", path, strerror(errno));
         return -1;
     }
-
-    // 3. Filter content
-    std::string filtered_content = filterMapsContent(original_content);
-
-    // 4. Create a pipe
-    int pipe_fds[2];
-    if (pipe2(pipe_fds, O_CLOEXEC) == -1) {
-        TL_LOGE("handle_open_maps: Failed to create pipe for %s: %s", path, strerror(errno));
-        errno = EMFILE; // Too many open files (or pipe error)
-        return -1;
-    }
-    int read_pipe_fd = pipe_fds[0];
-    int write_pipe_fd = pipe_fds[1];
-
-    // 5. Write filtered content to the pipe
-    std::thread writer_thread(pipeWriterThreadFunc, write_pipe_fd, std::move(filtered_content));
-    writer_thread.detach();
-
-    // 6. Store the mapping from fake_fd (read pipe) to original path
-    {
-        std::lock_guard<std::mutex> lock(filtered_fds_mutex);
-        filtered_fds[read_pipe_fd] = {path ? std::string(path) : "<unknown>"};
-        TL_LOGD("handle_open_maps: Created pipe %d -> %d for filtered maps %s. Returning fake_fd %d",
-                read_pipe_fd, write_pipe_fd, path, read_pipe_fd);
-    }
-
-    // 7. Return the read end of the pipe as the fake FD
-    return read_pipe_fd;
+    TL_LOGD("handle_open_maps: served filtered maps for %s (fd %d)", path, mfd);
+    return mfd;
 }
 
 // Hook for open
@@ -293,18 +240,14 @@ static int my_open(const char *path, int flags, ...) {
 
     if (isProcMapsFile(path)) {
         TL_LOGD("my_open: Intercepted open for maps file: %s", path);
-        // Call original open first to get the real FD
-        // IMPORTANT: We ignore O_CREAT, O_WRONLY, O_APPEND etc. for maps files
-        // Force read-only open for the real file.
-        int real_fd = original_open(path, O_RDONLY | O_CLOEXEC); // Use O_CLOEXEC for safety
+        // Force a read-only open of the real file, then substitute a filtered fd.
+        int real_fd = original_open(path, O_RDONLY | O_CLOEXEC);
         if (real_fd < 0) {
             TL_LOGE("my_open: Original open failed for %s: %s", path, strerror(errno));
-            return -1; // Return original error
+            return -1;
         }
-        // Handle filtering and return fake FD (pipe read end)
         return handle_open_maps(path, real_fd);
     } else {
-        // Not a maps file, call original open directly
         return original_open(path, flags, mode);
     }
 }
@@ -325,100 +268,17 @@ static int my_openat(int dirfd, const char *path, int flags, ...) {
         va_end(args);
     }
 
-    // Check if it's an absolute path or relative to /proc
-    // This check might need refinement depending on how apps use openat for /proc
-    bool potentially_maps = isProcMapsFile(path);
-    // If path is relative, we might need to resolve it based on dirfd, which is complex.
-    // For now, we primarily handle absolute paths passed to openat.
-
-    if (potentially_maps) {
+    if (isProcMapsFile(path)) {
         TL_LOGD("my_openat: Intercepted openat for maps file: %s (dirfd: %d)", path, dirfd);
-        // Similar to open, call original openat first, forcing read-only.
         int real_fd = original_openat(dirfd, path, O_RDONLY | O_CLOEXEC);
         if (real_fd < 0) {
             TL_LOGE("my_openat: Original openat failed for %s: %s", path, strerror(errno));
             return -1;
         }
-        // Handle filtering and return fake FD
         return handle_open_maps(path, real_fd);
     } else {
-        // Not a maps file, call original openat directly
         return original_openat(dirfd, path, flags, mode);
     }
-}
-
-// Hook for read
-static ssize_t my_read(int fd, void *buf, size_t count) {
-    if (!original_read) {
-        TL_LOGE("my_read: original_read is null!");
-        errno = EFAULT;
-        return -1;
-    }
-
-    bool is_filtered_fd;
-    {
-        std::lock_guard<std::mutex> lock(filtered_fds_mutex);
-        is_filtered_fd = filtered_fds.count(fd);
-    }
-
-    if (is_filtered_fd) {
-        // Reading from our pipe (filtered content)
-        TL_LOGD("my_read: Reading from filtered fd %d", fd);
-        return original_read(fd, buf, count); // Read directly from the pipe
-    } else {
-        // Normal read
-        return original_read(fd, buf, count);
-    }
-}
-
-// Hook for pread64
-static ssize_t my_pread64(int fd, void *buf, size_t count, off64_t offset) {
-    if (!original_pread64) {
-        TL_LOGE("my_pread64: original_pread64 is null!");
-        errno = EFAULT;
-        return -1;
-    }
-
-    bool is_filtered_fd;
-    {
-        std::lock_guard<std::mutex> lock(filtered_fds_mutex);
-        is_filtered_fd = filtered_fds.count(fd);
-    }
-
-    if (is_filtered_fd) {
-        // Reading from our pipe. Pipes don't support pread (seeking).
-        // We *could* simulate it by reading and discarding up to offset, but that's inefficient
-        // and breaks subsequent reads. The simplest is to return an error.
-        TL_LOGW("my_pread64: Attempted pread on filtered fd (pipe) %d. Not supported, returning ESPIPE.",
-                fd);
-        errno = ESPIPE; // Illegal seek (common error for pread on pipes)
-        return -1;
-    } else {
-        // Normal pread64
-        return original_pread64(fd, buf, count, offset);
-    }
-}
-
-// Hook for close
-static int my_close(int fd) {
-    if (!original_close) {
-        TL_LOGE("my_close: original_close is null!");
-        errno = EFAULT;
-        return -1;
-    }
-
-    bool was_filtered = false;
-    {
-        std::lock_guard<std::mutex> lock(filtered_fds_mutex);
-        if (filtered_fds.count(fd)) {
-            TL_LOGD("my_close: Closing filtered fd %d (pipe read end)", fd);
-            filtered_fds.erase(fd);
-            was_filtered = true;
-        }
-    }
-
-    // Always call original close, whether it was our pipe or a real fd
-    return original_close(fd);
 }
 
 class TracelessModule : public zygisk::ModuleBase {
@@ -426,12 +286,11 @@ public:
     void onLoad(Api *pApi, JNIEnv *pEnv) override {
         this->api = pApi;
         this->env = pEnv;
-        TL_LOGI("Traceless v0.0.2 loaded! (Zygisk API v%d)", ZYGISK_API_VERSION);
+        TL_LOGI("Traceless %s loaded! (Zygisk API v%d)", TRACELESS_VERSION, ZYGISK_API_VERSION);
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
         preSpecialize(args);
-//        preSpecialize(args);
     }
 
     void preServerSpecialize(ServerSpecializeArgs *args) override {
@@ -456,8 +315,8 @@ public:
         const std::string &mount_point = mount.getMountPoint();
         const std::string &mount_source = mount.getMountSource();
         const std::string &fs_type = mount.getFsType();
+        const std::string &root = mount.getRoot();
         const MountOptions &options = mount.getMountOptions();
-        const MountFlags flags = mount.getFlags();
 
         if (mount_point.rfind(magisk_data_path_prefix, 0) == 0) {
             TL_LOGD("shouldUnmount: YES - Mount point [%s] is in %s",
@@ -486,13 +345,49 @@ public:
             }
         }
 
-        if ((flags & MountFlags::BIND) && mount_source.rfind(magisk_modules_path_prefix, 0) == 0) {
-            TL_LOGD("shouldUnmount: YES - Bind mount [%s] originates from Magisk modules path [%s]",
-                    mount_point.c_str(), mount_source.c_str());
+        // Magic-mount / bind of module files. /proc/<pid>/mountinfo never carries
+        // a literal "bind" option (bind is a mount(2) call-time flag), so detect
+        // it by the source path or by the mount root pointing into a module tree.
+        if (mount_source.rfind(magisk_modules_path_prefix, 0) == 0 ||
+            root.find(module_root_marker) != std::string::npos) {
+            TL_LOGD("shouldUnmount: YES - Bind mount [%s] originates from a module tree (source=%s root=%s)",
+                    mount_point.c_str(), mount_source.c_str(), root.c_str());
             return true;
         }
 
         return false;
+    }
+
+    // Unmount every root-related mount visible in the CURRENT mount namespace.
+    // Shared by the companion (after setns into the app's namespace) and by the
+    // in-process fallback. Returns SUCCESS if the mount table could be read.
+    static int unmountMatchingInCurrentNs(pid_t target_pid) {
+        auto mounts = getMountInfo();
+        if (mounts.empty()) {
+            TL_LOGW("unmount: No mounts found for PID %d", target_pid);
+            return FAILURE;
+        }
+
+        int unmounted_count = 0;
+        int failed_count = 0;
+        // Reverse order so children detach before their parents.
+        for (auto it = mounts.rbegin(); it != mounts.rend(); ++it) {
+            if (shouldUnmount(*it)) {
+                const std::string &mount_point = it->getMountPoint();
+                if (umount2(mount_point.c_str(), MNT_DETACH) == 0) {
+                    TL_LOGI("unmount: Detached [%s] for PID %d", mount_point.c_str(), target_pid);
+                    unmounted_count++;
+                } else {
+                    TL_LOGW("unmount: Failed to detach [%s] for PID %d: %s",
+                            mount_point.c_str(), target_pid, strerror(errno));
+                    failed_count++;
+                }
+            }
+        }
+
+        TL_LOGI("[+] unmount pass complete for PID %d. Detached: %d, Failed: %d",
+                target_pid, unmounted_count, failed_count);
+        return SUCCESS;
     }
 
 private:
@@ -513,7 +408,7 @@ private:
             return;
         }
 
-        auto fn = [this](const std::string &lib) {
+        auto fn = [](const std::string &lib) {
             auto di = devinoby(lib.c_str());
             if (di) {
                 return *di;
@@ -526,185 +421,130 @@ private:
         };
 
         const char *process_name_chars = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (process_name_chars) {
-            stored_process_name = process_name_chars;
-            env->ReleaseStringUTFChars(args->nice_name, process_name_chars);
-            on_denylist = (api->getFlags() & zygisk::StateFlag::PROCESS_ON_DENYLIST);
-            TL_LOGD("preAppSpecialize: Process \"%s\" on denylist? %d",
-                    stored_process_name.c_str(),
-                    on_denylist);
-
-            // If the process is on the denylist, we need to umount things
-            if (on_denylist) {
-                pid_t pid = getpid(), ppid = getppid();
-                cfd = api->connectCompanion(); // Companion FD
-                api->exemptFd(cfd);
-
-                // Verify companion connection
-                if (write(cfd, &ppid, sizeof(ppid)) != sizeof(ppid)) {
-                    TL_LOGE("Communication error on PID: %d", pid);
-                    close(cfd);
-                    api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-                    return;
-                }
-
-                TL_LOGI("  |-> Communication: pid: %d, ppid: %d", pid, ppid);
-
-                // Check if we can find the libc.so and libandroid_runtime.so
-                std::tie(cdev, cinode) = fn("libc.so");
-                if (!cdev && !cinode) {
-                    TL_LOGE("Could not find dev/inode for libc.so");
-                    close(cfd);
-                    api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-                    return;
-                } else {
-                    TL_LOGI("[!] Found libc.so: dev=%u, inode=%lu", cdev, cinode);
-                }
-
-                std::tie(target_dev, target_inode) = fn("libandroid_runtime.so");
-                if (!target_dev && !target_inode) {
-                    TL_LOGE("Could not find dev/inode for libandroid_runtime.so");
-                    close(cfd);
-                    api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-                    return;
-                } else {
-                    TL_LOGI("[!] Found libandroid_runtime.so: dev=%u, inode=%lu", target_dev,
-                            target_inode);
-                }
-
-                // Registering unshare hook
-                api->pltHookRegister(target_dev, target_inode, "unshare",
-                                     reinterpret_cast<void *>(reshare),
-                                     reinterpret_cast<void **>(&original_unshare)
-                );
-                api->pltHookRegister(cdev, cinode, "fopen",
-                                     reinterpret_cast<void *>(my_fopen),
-                                     reinterpret_cast<void **>(&original_fopen)
-                );
-                api->pltHookRegister(cdev, cinode, "fgets",
-                                     reinterpret_cast<void *>(my_fgets),
-                                     reinterpret_cast<void **>(&original_fgets)
-                );
-
-                api->pltHookRegister(cdev, cinode, "open",
-                                     reinterpret_cast<void *>(my_open),
-                                     reinterpret_cast<void **>(&original_open)
-                );
-
-                api->pltHookRegister(cdev, cinode, "openat",
-                                     reinterpret_cast<void *>(my_openat),
-                                     reinterpret_cast<void **>(&original_openat)
-                );
-
-                api->pltHookRegister(cdev, cinode, "read",
-                                     reinterpret_cast<void *>(my_read),
-                                     reinterpret_cast<void **>(&original_read)
-                );
-
-                api->pltHookRegister(cdev, cinode, "pread64",
-                                     reinterpret_cast<void *>(my_pread64),
-                                     reinterpret_cast<void **>(&original_pread64)
-                );
-
-                api->pltHookRegister(cdev, cinode, "close",
-                                     reinterpret_cast<void *>(my_close),
-                                     reinterpret_cast<void **>(&original_close)
-                );
-
-                // Commit all registered PLT hooks after registration
-                if (!api->pltHookCommit()) {
-                    TL_LOGE("Failed to commit PLT hooks for PID %d! Hooks inactive.", pid);
-                    // Reset pointers as hooks are not active
-                    original_unshare = nullptr;
-                    original_fopen = nullptr;
-                    original_fgets = nullptr;
-                    original_open = nullptr;
-                    original_openat = nullptr;
-                    original_read = nullptr;
-                    original_pread64 = nullptr;
-                    original_close = nullptr;
-                    api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-                    return;
-                } else {
-                    TL_LOGI("Successfully committed PLT hooks for PID %d.", pid);
-                }
-
-                int res = unshare(CLONE_NEWNS);
-                if (res != 0) {
-                    LOGE("#[zygisk::preSpecialize] unshare: %s", strerror(errno));
-                    // There's nothing we can do except returning
-                    close(cfd);
-                    return;
-                }
-                res = mount("rootfs", "/", nullptr, MS_SLAVE | MS_REC, nullptr);
-                if (res != 0) {
-                    LOGE("#[zygisk::preSpecialize] mount(rootfs, \"/\", nullptr, MS_SLAVE | MS_REC, nullptr): returned %d: %d (%s)",
-                         res, errno, strerror(errno));
-                    // There's nothing we can do except returning
-                    close(cfd);
-                    return;
-                }
-
-                if (write(cfd, &pid, sizeof(pid)) != sizeof(pid)) {
-                    LOGE("#[zygisk::preSpecialize] write: [-> pid]: %s", strerror(errno));
-                    res = FAILURE; // Fallback to unmount from zygote
-                } else if (read(cfd, &res, sizeof(res)) != sizeof(res)) {
-                    LOGE("#[zygisk::preSpecialize] read: [<- status]: %s", strerror(errno));
-                    res = FAILURE; // Fallback to unmount from zygote
-                } else if (res == FAILURE) {
-                    LOGW("#[zygisk::preSpecialize]: Companion failed, fallback to unmount in zygote process");
-
-                }
-
-                close(cfd);
-
-                if (res == FAILURE) {
-                    LOGW("#[zygisk::preSpecialize]: Companion failed, fallback to unmount in zygote process");
-//                    unmount(mountRules, getMountInfo()); // Unmount in current (zygote) namespace as fallback
-                }
-                return;
-            }
-        } else {
+        if (!process_name_chars) {
             TL_LOGE("preAppSpecialize: Failed to get process nice_name.");
             on_denylist = false;
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        stored_process_name = process_name_chars;
+        env->ReleaseStringUTFChars(args->nice_name, process_name_chars);
+        on_denylist = (api->getFlags() & zygisk::StateFlag::PROCESS_ON_DENYLIST);
+        TL_LOGD("preAppSpecialize: Process \"%s\" on denylist? %d",
+                stored_process_name.c_str(), on_denylist);
+
+        // Only denylisted processes get the hook + unmount treatment.
+        if (!on_denylist) {
+            return;
+        }
+
+        pid_t pid = getpid();
+        cfd = api->connectCompanion(); // Companion FD
+        api->exemptFd(cfd);
+
+        // Check if we can find libc.so and libandroid_runtime.so
+        std::tie(cdev, cinode) = fn("libc.so");
+        if (!cdev && !cinode) {
+            TL_LOGE("Could not find dev/inode for libc.so");
+            close(cfd);
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+        TL_LOGI("[!] Found libc.so: dev=%u, inode=%lu", cdev, cinode);
+
+        std::tie(target_dev, target_inode) = fn("libandroid_runtime.so");
+        if (!target_dev && !target_inode) {
+            TL_LOGE("Could not find dev/inode for libandroid_runtime.so");
+            close(cfd);
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+        TL_LOGI("[!] Found libandroid_runtime.so: dev=%u, inode=%lu", target_dev, target_inode);
+
+        // Neutralize the framework's specialization-time unshare so it cannot
+        // escape the sanitized namespace we are about to build.
+        api->pltHookRegister(target_dev, target_inode, "unshare",
+                             reinterpret_cast<void *>(reshare),
+                             reinterpret_cast<void **>(&original_unshare));
+        // Sanitize /proc/<pid>/maps reads.
+        api->pltHookRegister(cdev, cinode, "fopen",
+                             reinterpret_cast<void *>(my_fopen),
+                             reinterpret_cast<void **>(&original_fopen));
+        api->pltHookRegister(cdev, cinode, "open",
+                             reinterpret_cast<void *>(my_open),
+                             reinterpret_cast<void **>(&original_open));
+        api->pltHookRegister(cdev, cinode, "openat",
+                             reinterpret_cast<void *>(my_openat),
+                             reinterpret_cast<void **>(&original_openat));
+
+        if (!api->pltHookCommit()) {
+            TL_LOGE("Failed to commit PLT hooks for PID %d! Hooks inactive.", pid);
+            original_unshare = nullptr;
+            original_fopen = nullptr;
+            original_open = nullptr;
+            original_openat = nullptr;
+            close(cfd);
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+        TL_LOGI("Successfully committed PLT hooks for PID %d.", pid);
+
+        // Build our own private, de-propagated mount namespace.
+        int res = unshare(CLONE_NEWNS);
+        if (res != 0) {
+            LOGE("#[zygisk::preSpecialize] unshare: %s", strerror(errno));
+            close(cfd);
+            return;
+        }
+        res = mount("rootfs", "/", nullptr, MS_SLAVE | MS_REC, nullptr);
+        if (res != 0) {
+            LOGE("#[zygisk::preSpecialize] mount(rootfs, \"/\", MS_SLAVE | MS_REC): %d (%s)",
+                 errno, strerror(errno));
+            close(cfd);
+            return;
+        }
+
+        // Hand our OWN pid to the companion and wait for it to finish unmounting
+        // inside this freshly-unshared namespace. The blocking read below is the
+        // synchronization barrier that guarantees the cleanup completed before we
+        // continue into specialization.
+        int status = FAILURE;
+        if (write(cfd, &pid, sizeof(pid)) != sizeof(pid)) {
+            LOGE("#[zygisk::preSpecialize] write: [-> pid]: %s", strerror(errno));
+            status = FAILURE;
+        } else if (read(cfd, &status, sizeof(status)) != sizeof(status)) {
+            LOGE("#[zygisk::preSpecialize] read: [<- status]: %s", strerror(errno));
+            status = FAILURE;
+        }
+        close(cfd);
+
+        if (status != SUCCESS) {
+            LOGW("#[zygisk::preSpecialize]: Companion failed; falling back to in-process unmount");
+            // We already own a private namespace, so a best-effort local unmount
+            // still only affects this process.
+            unmountMatchingInCurrentNs(pid);
         }
     }
 
     void handlePostSpecialization() {
-        // Unhook PLT hooks
+        // Restore the PLT hooks we installed.
         if (original_unshare) {
             api->pltHookRegister(target_dev, target_inode, "unshare", (void *) original_unshare,
                                  nullptr);
-            original_unshare = nullptr; // Clear pointer
+            original_unshare = nullptr;
         }
         if (original_fopen) {
             api->pltHookRegister(cdev, cinode, "fopen", (void *) original_fopen, nullptr);
-            original_fopen = nullptr; // Clear pointer
-        }
-        if (original_fgets) {
-            api->pltHookRegister(cdev, cinode, "fgets", (void *) original_fgets, nullptr);
-            original_fgets = nullptr; // Clear pointer
+            original_fopen = nullptr;
         }
         if (original_open) {
             api->pltHookRegister(cdev, cinode, "open", (void *) original_open, nullptr);
-            original_open = nullptr; // Clear pointer
+            original_open = nullptr;
         }
         if (original_openat) {
             api->pltHookRegister(cdev, cinode, "openat", (void *) original_openat, nullptr);
-            original_openat = nullptr; // Clear pointer
-        }
-        if (original_read) {
-            api->pltHookRegister(cdev, cinode, "read", (void *) original_read, nullptr);
-            original_read = nullptr; // Clear pointer
-        }
-        if (original_pread64) {
-            api->pltHookRegister(cdev, cinode, "pread64", (void *) original_pread64, nullptr);
-            original_pread64 = nullptr; // Clear pointer
-        }
-        if (original_close) {
-            api->pltHookRegister(cdev, cinode, "close", (void *) original_close, nullptr);
-            original_close = nullptr; // Clear pointer
+            original_openat = nullptr;
         }
 
         if (!api->pltHookCommit()) {
@@ -722,177 +562,39 @@ static void companionHandler(int client_fd) {
 
     pid_t target_pid = -1;
     ssize_t bytes_read = read(client_fd, &target_pid, sizeof(target_pid));
-    int read_errno = errno;
-
-    if (close(client_fd)) {
-        TL_LOGW("Companion: Failed to close client fd: %s", strerror(errno));
-    }
-
     if (bytes_read != sizeof(target_pid)) {
-        TL_LOGE("Companion: Failed to read PID (read %zd bytes, errno: %d - %s)",
-                bytes_read, read_errno, strerror(read_errno));
+        TL_LOGE("Companion: Failed to read PID (read %zd bytes: %s)",
+                bytes_read, strerror(errno));
+        int status = FAILURE;
+        (void) write(client_fd, &status, sizeof(status));
+        close(client_fd);
         return;
     }
 
     TL_LOGI("Companion: Received target PID %d. Processing.", target_pid);
 
+    // Do the namespace switch + unmount inside a forked child so the setns does
+    // not disturb the long-lived companion daemon.
     int fork_status = forkcall([target_pid]() -> int {
         TL_LOGD("Companion: Switching to mount namespace of PID %d", target_pid);
-
         if (!switchnsto(target_pid)) {
             TL_LOGE("Companion: Failed to switch to namespace of PID %d", target_pid);
-            return EXIT_FAILURE;
+            return FAILURE;
         }
-
         TL_LOGI("Companion: Successfully in namespace of PID %d", target_pid);
-        auto mounts = getMountInfo();
-        if (mounts.empty()) {
-            TL_LOGW("Companion: No mounts found for PID %d", target_pid);
-            return EXIT_FAILURE;
-        }
-
-        TL_LOGD("Companion: Found %zu mounts. Checking...", mounts.size());
-        int unmounted_count = 0;
-        int failed_count = 0;
-
-        for (auto it = mounts.rbegin(); it != mounts.rend(); ++it) {
-            if (TracelessModule::shouldUnmount(*it)) {
-                const char *mount_point = it->getMountPoint().c_str();
-                if (umount2(mount_point, MNT_DETACH) == 0) {
-                    TL_LOGI("Companion: Unmounted [%s] for PID %d", mount_point, target_pid);
-                    unmounted_count++;
-                } else {
-                    TL_LOGW("Companion: Failed to unmount [%s] for PID %d: %s",
-                            mount_point, target_pid, strerror(errno));
-                    failed_count++;
-                }
-            }
-        }
-
-        TL_LOGI("[+] Companion: Completed for PID %d. Unmounted: %d, Failed: %d",
-                target_pid, unmounted_count, failed_count);
-
-        bool z64 = false, z32 = false;
-        for (const auto &entry: std::filesystem::directory_iterator("/proc")) {
-            if (!entry.is_directory())
-                continue;
-            std::string name = entry.path().filename();
-            if (!std::all_of(name.begin(), name.end(), ::isdigit)) continue;
-            auto pid = static_cast<pid_t>(std::stoi(name));
-            std::ifstream cmdline(entry.path() / "cmdline");
-            std::string cmd;
-            std::getline(cmdline, cmd, '\0');
-            if (cmd == "zygote64") {
-                std::ifstream statusFile(("/proc/" + std::to_string(pid) + "/status"));
-                std::string line;
-                pid_t ppid = -1;
-                while (std::getline(statusFile, line)) {
-                    if (line.rfind("PPid:", 0) == 0) {
-                        ppid = std::stoi(line.substr(5));
-                        break;
-                    }
-                }
-                if (ppid != 1) continue;
-                if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) == -1) {
-                    LOGE("#[ps::Companion] ptrace(PTRACE_ATTACH, %d, nullptr, nullptr): %s", pid,
-                         strerror(errno));
-                    continue;
-                }
-                waitpid(pid, nullptr, 0);
-                if (ptrace(PTRACE_SETOPTIONS, pid, nullptr, PTRACE_O_TRACEFORK) == -1) {
-                    LOGE("#[ps::Companion] ptrace(PTRACE_SETOPTIONS, %d, nullptr, PTRACE_O_TRACEFORK): %s",
-                         pid, strerror(errno));
-                    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-                    continue;
-                }
-                if (ptrace(PTRACE_CONT, pid, nullptr, nullptr) == -1) {
-                    LOGE("#[ps::Companion] ptrace(PTRACE_CONT, %d, nullptr, nullptr): %s", pid,
-                         strerror(errno));
-                    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-                    continue;
-                }
-                while (true) {
-                    int status = 0;
-                    pid_t eventPid = waitpid(-1, &status, 0);
-                    if (WIFSTOPPED(status)) {
-                        if (status >> 16 == PTRACE_EVENT_FORK) {
-                            unsigned long newChildPid = 0;
-                            ptrace(PTRACE_GETEVENTMSG, eventPid, nullptr, &newChildPid);
-                            LOGD("#[ps::Companion] Fork detected (%d -> fork() -> %lu)", pid,
-                                 newChildPid);
-                            ptrace(PTRACE_DETACH, newChildPid, nullptr, nullptr);
-                            LOGD("#[ps::Companion] Detaching (%lu)", newChildPid);
-                            ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-                            LOGD("#[ps::Companion] Detaching (%d)", pid);
-                            break;
-                        } else {
-                            ptrace(PTRACE_CONT, eventPid, nullptr, nullptr);
-                        }
-                    }
-                }
-                z64 = true;
-                continue;
-            }
-            if (cmd == "zygote32") {
-                std::ifstream statusFile(("/proc/" + std::to_string(pid) + "/status"));
-                std::string line;
-                pid_t ppid = -1;
-                while (std::getline(statusFile, line)) {
-                    if (line.rfind("PPid:", 0) == 0) {
-                        ppid = std::stoi(line.substr(5));
-                        break;
-                    }
-                }
-                if (ppid != 1) continue;
-                if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) == -1) {
-                    LOGE("#[ps::Companion] ptrace(PTRACE_ATTACH, %d, nullptr, nullptr): %s", pid,
-                         strerror(errno));
-                    continue;
-                }
-                waitpid(pid, nullptr, 0);
-                if (ptrace(PTRACE_SETOPTIONS, pid, nullptr, PTRACE_O_TRACEFORK) == -1) {
-                    LOGE("#[ps::Companion] ptrace(PTRACE_SETOPTIONS, %d, nullptr, PTRACE_O_TRACEFORK): %s",
-                         pid, strerror(errno));
-                    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-                    continue;
-                }
-                if (ptrace(PTRACE_CONT, pid, nullptr, nullptr) == -1) {
-                    LOGE("#[ps::Companion] ptrace(PTRACE_CONT, %d, nullptr, nullptr): %s", pid,
-                         strerror(errno));
-                    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-                    continue;
-                }
-                while (true) {
-                    int status = 0;
-                    pid_t eventPid = waitpid(-1, &status, 0);
-                    if (WIFSTOPPED(status)) {
-                        if (status >> 16 == PTRACE_EVENT_FORK) {
-                            unsigned long newChildPid = 0;
-                            ptrace(PTRACE_GETEVENTMSG, eventPid, nullptr, &newChildPid);
-                            LOGD("#[ps::Companion] Fork detected (%d -> fork() -> %lu)", pid,
-                                 newChildPid);
-                            ptrace(PTRACE_DETACH, newChildPid, nullptr, nullptr);
-                            LOGD("#[ps::Companion] Detaching (%lu)", newChildPid);
-                            ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
-                            LOGD("#[ps::Companion] Detaching (%d)", pid);
-                            break;
-                        } else {
-                            ptrace(PTRACE_CONT, eventPid, nullptr, nullptr);
-                        }
-                    }
-                }
-                z32 = true;
-                continue;
-            }
-        }
-        return z64 || z32;
-
-        return EXIT_SUCCESS;
+        return TracelessModule::unmountMatchingInCurrentNs(target_pid);
     });
 
-    if (fork_status != EXIT_SUCCESS) {
-        TL_LOGE("Companion: Unmount task failed for PID %d (status: %d)",
-                target_pid, fork_status);
+    int status = (fork_status == SUCCESS) ? SUCCESS : FAILURE;
+    if (status != SUCCESS) {
+        TL_LOGE("Companion: Unmount task failed for PID %d (status: %d)", target_pid, fork_status);
+    }
+    // Report the outcome back so the app can run its in-process fallback if needed.
+    if (write(client_fd, &status, sizeof(status)) != static_cast<ssize_t>(sizeof(status))) {
+        TL_LOGW("Companion: Failed to send status for PID %d: %s", target_pid, strerror(errno));
+    }
+    if (close(client_fd)) {
+        TL_LOGW("Companion: Failed to close client fd: %s", strerror(errno));
     }
 }
 
