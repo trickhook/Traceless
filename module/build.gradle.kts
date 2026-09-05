@@ -22,11 +22,6 @@ android {
             abiFilters.addAll(abiList)
         }
         externalNativeBuild {
-            /*
-            ndkBuild {
-                arguments("MODULE_NAME=$moduleId")
-            }
-            */
             cmake {
                 cppFlags("-std=c++20")
                 arguments(
@@ -37,11 +32,6 @@ android {
         }
     }
     externalNativeBuild {
-        /*
-        ndkBuild {
-            path("src/main/cpp/Android.mk")
-        }
-        */
         cmake {
             path("src/main/cpp/CMakeLists.txt")
         }
@@ -137,8 +127,8 @@ androidComponents.onVariants { variant ->
             {
                 "versionCode": $verCode,
                 "version": "$verName",
-                "zipUrl": "https://github.com/MhmRdd/traceless/releases/download/${verName.removePrefix("v")}/$zipFileName",
-                "changelog": "https://mhmrdd.github.io/01000004/zygisk/traceless_changelog.md"
+                "zipUrl": "https://github.com/trickhook/Traceless/releases/download/${verName.removePrefix("v")}/$zipFileName",
+                "changelog": "https://raw.githubusercontent.com/trickhook/Traceless/main/.github/updates/traceless_changelog.md"
             }
             """.trimIndent()
             jsonFile.writeText(jsonContent)

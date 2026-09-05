@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(sample)
+project(traceless)
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_definitions(-DDEBUG_BUILD)

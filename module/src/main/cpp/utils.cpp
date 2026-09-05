@@ -1,3 +1,5 @@
+#pragma once
+
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -13,20 +15,21 @@
 #include <vector>
 #include <tuple>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <functional>
 #include <sys/mman.h>
 #include <link.h>
 #include <fcntl.h>
+#include <android/log.h>
 #include "log.h"
-// Adicione estas linhas no topo
-#include <functional>  // Para std::function
-#include <android/log.h>  // Para ANDROID_LOG_*
-#include <sys/stat.h>
 
 inline std::optional<std::pair<dev_t, ino_t>> devinoby(const char *lib) {
     struct State {
         const char *needle;
         std::optional<std::pair<dev_t, ino_t>> result;
-    } state = {lib};
+    } state = {lib, std::nullopt};
 
     dl_iterate_phdr([](struct dl_phdr_info *info, size_t, void *data) -> int {
         auto *s = static_cast<State *>(data);
@@ -64,10 +67,12 @@ devinobymap(const std::string &lib, bool useFind = false, unsigned int *ln = nul
             std::string major_hex, minor_hex;
             if (std::getline(devsplit, major_hex, ':') &&
                 std::getline(devsplit, minor_hex)) {
-                int major = std::stoi(major_hex, nullptr, 16);
-                int minor = std::stoi(minor_hex, nullptr, 16);
+                // Exception-free parsing: the module is built with -fno-exceptions,
+                // so std::stoi/std::stoul would abort() on a malformed field.
+                int major = static_cast<int>(strtol(major_hex.c_str(), nullptr, 16));
+                int minor = static_cast<int>(strtol(minor_hex.c_str(), nullptr, 16));
                 dev_t devnum = makedev(major, minor);
-                ino_t inode = std::stoul(inode_str);
+                ino_t inode = static_cast<ino_t>(strtoul(inode_str.c_str(), nullptr, 10));
                 if (ln)
                     *ln = index;
                 return {devnum, inode};

@@ -8,8 +8,18 @@
 #include <cstdint>
 #include <type_traits>
 #include <algorithm>
+#include <cstdlib>
 #include <sys/types.h>
 #include <sys/sysmacros.h>
+
+// Exception-free integer parsing. The whole module is built with
+// -fno-exceptions, so std::stoi/std::stoul would abort() on malformed input
+// instead of throwing. strtol/strtoul never throw and simply yield 0 on a
+// non-numeric field, which is a safe default for the /proc pseudo-files parsed
+// here.
+static inline int tl_stoi(const std::string& s, int base = 10) {
+	return static_cast<int>(strtol(s.c_str(), nullptr, base));
+}
 
 enum class MountFlags : uint64_t {
 	RO         = 1ull << 0,
@@ -128,9 +138,12 @@ public:
 		auto it = std::find(parts.begin(), parts.end(), std::string("-"));
 		if (it == parts.end() || std::distance(parts.begin(), it) < 6)
 			return;
-		size_t sep_idx = std::distance(parts.begin(), it);
-		mnt_id = std::stoi(parts[0]);
-		mnt_parent_id = std::stoi(parts[1]);
+		size_t sep_idx = static_cast<size_t>(std::distance(parts.begin(), it));
+		// Need at least fs_type, source and options after the "-" separator.
+		if (parts.size() <= sep_idx + 3)
+			return;
+		mnt_id = tl_stoi(parts[0]);
+		mnt_parent_id = tl_stoi(parts[1]);
 		parseMajorMinor(parts[2]);
 		root = parts[3];
 		mnt_pnt = parts[4];
@@ -140,10 +153,12 @@ public:
 		fs_type = parts[sep_idx + 1];
 		mnt_src = parts[sep_idx + 2];
 		parseOptions(parts[sep_idx + 3]);
+		valid = true;
 	}
 
 	~MountInfo() = default;
 
+	[[nodiscard]] bool isValid() const { return valid; }
 	[[nodiscard]] int getMountId() const { return mnt_id; }
 	[[nodiscard]] int getParentId() const { return mnt_parent_id; }
 	[[nodiscard]] dev_t getDev() const { return dev; }
@@ -156,8 +171,9 @@ public:
 	[[nodiscard]] const MountOptions& getMountOptions() const { return mnt_opts; }
 
 private:
-	int mnt_id;
-	int mnt_parent_id;
+	bool valid = false;
+	int mnt_id = 0;
+	int mnt_parent_id = 0;
 	dev_t dev = 0;
 	std::string root;
 	std::string mnt_pnt;
@@ -180,10 +196,10 @@ private:
 	void parsePropagation(const std::string& pg) {
 		if (pg.find("master:") == 0) {
 			propagation.type = PropagationType::SLAVE;
-			propagation.id = std::stoi(pg.substr(7));
+			propagation.id = tl_stoi(pg.substr(7));
 		} else if (pg.find("shared:") == 0) {
 			propagation.type = PropagationType::SHARED;
-			propagation.id = std::stoi(pg.substr(7));
+			propagation.id = tl_stoi(pg.substr(7));
 		} else if (pg == "unbindable") {
 			propagation.type = PropagationType::UNBINDABLE;
 		} else if (pg == "private") {
@@ -198,38 +214,12 @@ private:
 	void parseMajorMinor(const std::string& mmstr) {
 		size_t sep = mmstr.find(':');
 		if (sep != std::string::npos) {
-			int major = std::stoi(mmstr.substr(0, sep));
-			int minor = std::stoi(mmstr.substr(sep + 1));
+			int major = tl_stoi(mmstr.substr(0, sep));
+			int minor = tl_stoi(mmstr.substr(sep + 1));
 			dev = makedev(major, minor);
 		} else {
 			dev = 0;
 		}
-	}
-};
-
-class MountRootResolver {
-private:
-	std::unordered_map<dev_t, std::string> dmm;
-
-public:
-	explicit MountRootResolver(const std::vector<MountInfo>& mounts) {
-		for (const auto& mount : mounts) {
-			if (mount.getRoot() == "/") {
-				dmm[mount.getDev()] = mount.getMountPoint();
-			}
-		}
-	}
-
-	~MountRootResolver() = default;
-
-	std::string resolveRoot(const MountInfo& mount) {
-		auto dev = mount.getDev();
-		auto it = dmm.find(dev);
-		if (it != dmm.end()) {
-			if (it->second != "/")
-				return it->second + mount.getRoot();
-		}
-		return mount.getRoot();
 	}
 };
 
@@ -241,7 +231,9 @@ inline std::vector<MountInfo> getMountInfo(const std::string& path = "/proc/self
 		return mounts;
 	while (std::getline(mi, line)) {
 		MountInfo mountInfo(line);
-		mounts.emplace_back(std::move(mountInfo));
+		// Skip blank/malformed lines rather than storing half-constructed entries.
+		if (mountInfo.isValid())
+			mounts.emplace_back(std::move(mountInfo));
 	}
 	mi.close();
 	return mounts;
