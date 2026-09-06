@@ -59,6 +59,8 @@ extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
 extract "$ZIPFILE" 'cleanup.sh'      "$MODPATH"
+mkdir -p "$MODPATH/system/bin"
+extract "$ZIPFILE" 'system/bin/traceless-cli' "$MODPATH"
 echo "$DESCRIPTION" > "$MODPATH"/description
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
@@ -95,6 +97,11 @@ else
 fi
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
+# The CLI ships under system/bin; magisk bind-mounts it into /system/bin so a
+# regular `traceless-cli` invocation from any shell works. It must be exec.
+if [ -f "$MODPATH/system/bin/traceless-cli" ]; then
+  set_perm "$MODPATH/system/bin/traceless-cli" 0 0 0755
+fi
 
 mkdir -p /data/adb/traceless
 if [ ! -e "/data/adb/traceless/umount" ]; then

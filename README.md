@@ -28,6 +28,39 @@ Additionally, `service.sh` resets a set of verified-boot/debuggable properties
 (`ro.boot.verifiedbootstate`, `ro.debuggable`, `ro.build.type`, …) to their
 "stock, locked" values as a basic software-property layer.
 
+## Universal mode
+
+By default Traceless only touches DenyList entries. **Universal mode** switches
+it to hooking every non-whitelisted app spawn instead — useful when you want
+hiding coverage without having to maintain a per-app list.
+
+Toggle it with the bundled CLI (installed as `/system/bin/traceless-cli`):
+
+```sh
+su -c 'traceless-cli enable-universal'   # turn on
+su -c 'traceless-cli disable-universal'  # turn off (back to denylist-only)
+su -c 'traceless-cli status'             # show current mode
+```
+
+The toggle is a marker file at `/data/adb/traceless/universal.on`; changes
+apply to the *next* app spawn, no reboot required.
+
+**Whitelist (always skipped, even when universal mode is on):**
+
+- Processes the root manager granted root (`PROCESS_GRANTED_ROOT`).
+- Framework: `system_server`, `zygote`, `zygote64`, `usap32`, `usap64`,
+  `webview_zygote*`.
+- Root-manager packages: `com.topjohnwu.magisk`, `me.weishu.kernelsu`,
+  `com.rifsxd.ksunext`, `io.github.a13e300.ksuwebui`, `me.bmax.apatch`
+  (and their `:sub` process forks).
+- Any `nice_name` containing `magisk`, `ksu`, or `apatch` (case-insensitive)
+  — catches OEM helper processes.
+- UID < 10000 (system/root/shell/services) and UID 1053 (WebView zygote).
+
+Universal mode does **not** improve Play Integrity STRONG / DEVICE
+attestation coverage — those are hardware-backed and unaffected by signature
+hiding. See the Limitations section.
+
 ## Requirements & compatibility
 
 - **Root:** Magisk (with Zygisk), KernelSU, or APatch — installed via the manager
@@ -60,9 +93,11 @@ integrity at install time.
 Traceless is a **signature-based mount/maps hider**, not a kernel-level solution.
 It is effective against `mountinfo`/`maps` inspection from denylisted apps, but:
 
-- Coverage equals the DenyList's completeness — an app you did not add is not hidden.
+- Default coverage equals the DenyList's completeness. Universal mode extends
+  coverage to every non-whitelisted app spawn, but does not change what a hooked
+  process sees.
 - Property spoofing only defeats the software-property tier; **hardware-backed key
-  attestation** (Play Integrity STRONG/DEVICE) is unaffected.
+  attestation** (Play Integrity STRONG/DEVICE) is unaffected in either mode.
 - Readers using raw syscalls can still bypass the libc-level `maps` filtering.
 
 Please report issues with your root solution, Android version, device, and a

@@ -9,14 +9,17 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstdarg>
+#include <cctype>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <sys/stat.h>
 #include <android/log.h>
 #include "mountsinfo.cpp"
 #include "utils.cpp"
 #include <sys/mount.h>
 #include <sys/syscall.h>
+#include <algorithm>
 #include <set>
 #include <string>
 #include <vector>
@@ -69,6 +72,83 @@ static const char *const maps_filter_target = "jit-cache-zygisk_traceless";
 static const char *const self_maps_path = "/proc/self/maps";
 static const char *const pid_maps_prefix = "/proc/";
 static const char *const maps_suffix = "/maps";
+
+// --- Universal Mode ---
+// When this marker exists, the module hooks every non-whitelisted spawn instead
+// of only the ones flagged PROCESS_ON_DENYLIST. `traceless-cli enable-universal`
+// creates it; `traceless-cli disable-universal` removes it. No reboot needed —
+// the check runs on every preAppSpecialize.
+static const char *const universal_mode_marker = "/data/adb/traceless/universal.on";
+
+// WebView zygote lives at a well-known AID; skipping it prevents the child app
+// zygote from mangling its own base namespace.
+static const int kWebViewZygoteUid = 1053;
+// Regular third-party apps start at 10000 (AID_APP_START). Anything below that
+// is system/root/shell/services and we must not touch it in universal mode.
+static const int kFirstAppUid = 10000;
+
+// Exact match on the app-process nice_name. Zygote itself never reaches
+// preAppSpecialize (only preServerSpecialize) but the child zygotes and USAP
+// pool workers do; keep them off the hook list.
+static const std::set<std::string> kUniversalCriticalNames = {
+        "system_server",
+        "zygote",
+        "zygote64",
+        "usap32",
+        "usap64",
+        "webview_zygote",
+        "webview_zygote32",
+        "webview_zygote64",
+};
+
+// Prefix match: any nice_name starting with one of these is a root manager's
+// own process. Losing sight of /data/adb inside these breaks the manager.
+static const std::vector<std::string> kUniversalManagerPackages = {
+        "com.topjohnwu.magisk",
+        "io.github.a13e300.ksuwebui",
+        "io.github.vvb2060.magisk",
+        "me.weishu.kernelsu",
+        "com.rifsxd.ksunext",
+        "me.bmax.apatch",
+};
+
+// Substring match (case-folded): anything that self-identifies as root
+// tooling. Deliberately loose because random OEM builds ship additional
+// helpers under names like "magiskhide_v2", "ksu_helper", etc.
+static const std::vector<std::string> kUniversalNameSubstrings = {
+        "magisk",
+        "ksu",
+        "apatch",
+};
+
+static bool universalModeEnabled() {
+    struct stat st{};
+    return ::stat(universal_mode_marker, &st) == 0;
+}
+
+static bool isUniversalWhitelisted(int uid, const std::string &nice_name) {
+    if (uid < kFirstAppUid) return true;
+    if (uid == kWebViewZygoteUid) return true;
+    if (kUniversalCriticalNames.count(nice_name)) return true;
+
+    for (const auto &pkg: kUniversalManagerPackages) {
+        // Match "<pkg>" and any process forked off it ("<pkg>:sub").
+        if (nice_name == pkg || nice_name.rfind(pkg + ":", 0) == 0 ||
+            nice_name.rfind(pkg + ".", 0) == 0) {
+            return true;
+        }
+    }
+
+    std::string lowered;
+    lowered.reserve(nice_name.size());
+    for (char c: nice_name) {
+        lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    for (const auto &needle: kUniversalNameSubstrings) {
+        if (lowered.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
 
 // --- Zygisk Module Implementation ---
 // We hook the framework's unshare (in libandroid_runtime, the actual caller of
@@ -431,12 +511,24 @@ private:
         stored_process_name = process_name_chars;
         env->ReleaseStringUTFChars(args->nice_name, process_name_chars);
         on_denylist = (api->getFlags() & zygisk::StateFlag::PROCESS_ON_DENYLIST);
-        TL_LOGD("preAppSpecialize: Process \"%s\" on denylist? %d",
-                stored_process_name.c_str(), on_denylist);
 
-        // Only denylisted processes get the hook + unmount treatment.
-        if (!on_denylist) {
+        const int spec_uid = args->uid;
+        const bool universal_on = universalModeEnabled();
+        const bool universal_target =
+                universal_on && !isUniversalWhitelisted(spec_uid, stored_process_name);
+        TL_LOGD("preAppSpecialize: Process \"%s\" uid=%d denylist=%d universal=%d target=%d",
+                stored_process_name.c_str(), spec_uid, on_denylist, universal_on,
+                universal_target);
+
+        // Denylist path stays the default. Universal mode is an OR on top of it:
+        // if the marker is set and the process is not on our whitelist, we treat
+        // it like a denylisted one.
+        if (!on_denylist && !universal_target) {
             return;
+        }
+        if (universal_target && !on_denylist) {
+            TL_LOGI("preAppSpecialize: universal-mode target \"%s\" (uid=%d)",
+                    stored_process_name.c_str(), spec_uid);
         }
 
         pid_t pid = getpid();
