@@ -16,6 +16,8 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 add_library(${MODULE_NAME} SHARED traceless.cpp)
-target_link_libraries(${MODULE_NAME} cxx log)
-
-add_subdirectory(external)
+# The STL comes from ANDROID_STL=c++_static (see module/build.gradle.kts); we
+# no longer link the external "cxx" static library or descend into external/,
+# because the topjohnwu/libcxx submodule pinned there is a Magisk-minimal
+# tree without the LLVM sources that external/CMakeLists.txt lists.
+target_link_libraries(${MODULE_NAME} log)

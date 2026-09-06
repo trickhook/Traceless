@@ -1,1 +1,4 @@
 allow zygote adb_data_file dir search
+# Universal-mode marker read: zygote (running preAppSpecialize) needs to
+# `stat` /data/adb/traceless/universal.on to decide whether to hook.
+allow zygote adb_data_file file getattr

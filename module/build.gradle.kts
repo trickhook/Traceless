@@ -25,7 +25,11 @@ android {
             cmake {
                 cppFlags("-std=c++20")
                 arguments(
-                    "-DANDROID_STL=none",
+                    // c++_static uses the NDK's own libc++. The topjohnwu/libcxx
+                    // submodule under external/ is a Magisk-minimal build that
+                    // no longer matches the LLVM tree external/CMakeLists.txt
+                    // expects, so we drop it entirely (see CMakeLists.txt).
+                    "-DANDROID_STL=c++_static",
                     "-DMODULE_NAME=$moduleId"
                 )
             }

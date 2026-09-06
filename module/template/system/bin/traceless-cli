@@ -1,0 +1,77 @@
+#!/system/bin/sh
+# traceless-cli - toggle Traceless universal mode.
+#
+# Universal mode makes Traceless apply mount hiding + /proc/maps sanitization
+# to every non-whitelisted app spawn, not only the ones on the root manager's
+# DenyList. The toggle is a marker file at /data/adb/traceless/universal.on -
+# new spawns pick up the change immediately, no reboot required.
+#
+# Usage:
+#   traceless-cli enable-universal     Turn universal mode ON
+#   traceless-cli disable-universal    Turn universal mode OFF (denylist-only)
+#   traceless-cli status               Show current mode
+#
+# Whitelist (never hooked, even in universal mode):
+#   * PIDs granted root by the manager (PROCESS_GRANTED_ROOT)
+#   * system_server / zygote / zygote64 / usap* / webview_zygote*
+#   * Any nice_name containing "magisk", "ksu", or "apatch" (case-insensitive)
+#   * Root-manager packages: com.topjohnwu.magisk, me.weishu.kernelsu,
+#     me.bmax.apatch, com.rifsxd.ksunext, io.github.a13e300.ksuwebui
+#   * UID < 10000 (system/root/shell/services) and UID 1053 (WebView zygote)
+
+set -u
+
+FLAG_DIR=/data/adb/traceless
+FLAG_FILE="$FLAG_DIR/universal.on"
+
+fail() {
+  echo "traceless-cli: $*" >&2
+  exit 1
+}
+
+require_root() {
+  [ "$(id -u)" = "0" ] || fail "must be root (try: su -c 'traceless-cli $1')"
+}
+
+show_status() {
+  if [ -f "$FLAG_FILE" ]; then
+    echo "Universal mode: ENABLED"
+    echo "Marker:         $FLAG_FILE"
+    echo "Behavior:       every non-whitelisted app spawn is hooked."
+  else
+    echo "Universal mode: DISABLED (denylist-only)"
+    echo "Behavior:       only apps on the root manager's DenyList are hooked."
+  fi
+}
+
+case "${1:-status}" in
+  enable-universal|enable|on)
+    require_root "$1"
+    mkdir -p "$FLAG_DIR" || fail "mkdir $FLAG_DIR failed"
+    : > "$FLAG_FILE" || fail "cannot create $FLAG_FILE"
+    chmod 0644 "$FLAG_FILE" 2>/dev/null || true
+    chown 0:0 "$FLAG_FILE" 2>/dev/null || true
+    echo "Universal mode: ENABLED"
+    echo "Marker created at $FLAG_FILE."
+    echo "New app spawns will be hooked. Already-running apps stay as they are."
+    ;;
+  disable-universal|disable|off)
+    require_root "$1"
+    if [ -f "$FLAG_FILE" ]; then
+      rm -f "$FLAG_FILE" || fail "cannot remove $FLAG_FILE"
+    fi
+    echo "Universal mode: DISABLED"
+    echo "Falling back to denylist-only behavior on the next spawn."
+    ;;
+  status|"")
+    show_status
+    ;;
+  -h|--help|help)
+    sed -n '2,20p' "$0"
+    ;;
+  *)
+    echo "traceless-cli: unknown subcommand '$1'" >&2
+    echo "Usage: traceless-cli {enable-universal|disable-universal|status}" >&2
+    exit 2
+    ;;
+esac
