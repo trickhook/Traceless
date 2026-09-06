@@ -32,8 +32,30 @@ jobs:
 
       - name: Build release module zip
         run: |
+          set -o pipefail
           chmod +x ./gradlew
-          ./gradlew :module:zipRelease --stacktrace
+          ./gradlew :module:zipRelease --stacktrace 2>&1 | tee gradle-build.log
+
+      - name: Show CMake / native errors on failure
+        if: failure()
+        run: |
+          echo "===== C/C++ and CMake error lines ====="
+          grep -nE 'C/C\+\+:|CMake Error|CMake Warning|Cannot find source file|No SOURCES|error:|fatal error' gradle-build.log | head -200 || true
+          echo "===== context around first 'CMake Error' ====="
+          grep -nB2 -A8 'CMake Error' gradle-build.log | head -160 || true
+          echo "===== metadata_generation_stderr.txt (if present) ====="
+          find module -name 'metadata_generation_stderr.txt' -print -exec cat {} \; || true
+
+      - name: Upload native build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxx-logs
+          path: |
+            gradle-build.log
+            module/.cxx/**
+            module/build/**/cxx/**
+          if-no-files-found: ignore
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
